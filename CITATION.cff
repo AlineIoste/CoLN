@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the associated CoLN paper."
+title: "CoLN: Collaborative Federated Learning for Healthcare Prediction"
+version: 0.1.0
+license: "TBD"
+authors:
+  - family-names: "Ioste"
+    given-names: "Aline"
+repository-code: "https://github.com/AlineIoste/CoLN"

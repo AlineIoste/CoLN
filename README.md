@@ -1,4 +1,4 @@
-# CoLN — Collaborative Federated Learning for Healthcare Prediction
+# CoLN — Collaborative Learning with Non-convex aggregation
 
 This repository provides a reference implementation of **CoLN** (Collaborative Learning with Non-convex aggregation) as described in the accompanying paper.
 
@@ -42,10 +42,6 @@ clients, scaler, feature_cols = prepare_clients_from_dataframe(
 
 global_model, history, final_metrics = run_federated_coln(clients, rounds=15)
 ```
-
-## Data availability
-
-Clinical datasets analyzed in the study were collected under institutional agreements and national privacy regulations and therefore cannot be made publicly available. Access to the data may be granted upon reasonable request to the IACOVBR group, with intermediation by the corresponding authors, subject to institutional approvals and compliance with applicable data protection regulations.
 
 ## Citation
 

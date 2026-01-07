@@ -1,6 +1,6 @@
-# CoLN — Collaborative Learning with Non-convex aggregation
+# CoLN — Combined Learning with Non-convex aggregation
 
-This repository provides a reference implementation of **CoLN** (Collaborative Learning with Non-convex aggregation) as described in the accompanying paper.
+This repository provides a reference implementation of **CoLN** (Combined Learning with Non-convex aggregation) as described in the accompanying paper.
 
 ## What’s in this repo
 

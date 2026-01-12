@@ -1,0 +1,221 @@
+def combined_learning_coln(
+    models_weights,
+    r_h_list,
+    c,
+    lambda_beta,
+    use_layer_c,
+    gamma
+):
+    """
+    CoLN aggregation:
+    - Usa softmax para calcular α^h
+    - Calcula LayerDistance(ℓ) e WeightDistance(i,ℓ)
+    - Define β_{i,ℓ} conforme regra (se WeightDist < LayerDist, senão 0)
+    - Faz a combinação final fora do convex hull
+    """
+
+    H = len(models_weights)
+    L = len(models_weights[0])
+    combined_weights = []
+
+    # ---- α^h (global, softmax sobre r_h) ----
+    r_h_arr = np.array(r_h_list, dtype=np.float64)
+    alpha_h_base = np.exp(c * r_h_arr) ** gamma
+    alpha_h_base = alpha_h_base / np.sum(alpha_h_base)
+
+    for layer_idx in range(L):
+        layer_weights = [mw[layer_idx] for mw in models_weights]
+        layer_shape = layer_weights[0].shape
+        m_l = int(np.prod(layer_shape))
+        flat = np.array([w.flatten() for w in layer_weights], dtype=np.float64)
+
+        # ---- LayerDistance ----
+        if H >= 2:
+            pair_sum = 0.0
+            for i in range(H):
+                for j in range(i+1, H):
+                    pair_sum += np.sum((flat[i] - flat[j])**2)
+            layer_dist = np.sqrt(pair_sum) / max(m_l, 1)
+        else:
+            layer_dist = 0.0
+
+        # ---- Ajuste do α por camada (opcional) ----
+        if use_layer_c and layer_dist > 1e-6:
+            local_c = c / (1.0 + layer_dist)
+            alpha_h = np.exp(local_c * r_h_arr) ** gamma
+            alpha_h = alpha_h / np.sum(alpha_h)
+        else:
+            alpha_h = alpha_h_base
+
+        # ---- Agregação convexa inicial ----
+        combined_flat = np.zeros(m_l, dtype=np.float64)
+        for h in range(H):
+            combined_flat += alpha_h[h] * flat[h]
+
+        # ---- Termo não-convexo β_{i,ℓ} ----
+        if H >= 2 and lambda_beta > 0:
+            for i in range(m_l):
+                # WeightDistance(i,ℓ)
+                wd_sum = 0.0
+                for j in range(H):
+                    for k in range(j+1, H):
+                        wd_sum += (flat[j, i] * r_h_arr[j] - flat[k, i] * r_h_arr[k])**2
+                weight_dist = np.sqrt(wd_sum)
+
+                # β_{i,ℓ} regra
+                if weight_dist < layer_dist:
+                    beta = weight_dist
+                else:
+                    beta = 0.0
+
+                # Adiciona termo não-convexo
+                combined_flat[i] += lambda_beta * beta
+
+        # ---- Reconstrução da camada ----
+        combined_layer = combined_flat.reshape(layer_shape).astype(layer_weights[0].dtype, copy=False)
+        combined_weights.append(combined_layer)
+
+    return combined_weights
+
+
+def schedule_c(round_idx, total_rounds):
+    # começa suave e aumenta aos poucos (evita α muito aguda no início)
+    # faixas típicas: 0.5 → 1.5
+    return 0.5 + 1.0 * (round_idx - 1) / max(total_rounds - 1, 1)
+
+def schedule_lambda_beta(round_idx, total_rounds):
+    # warm-up (rodadas 1-2): 0; depois sobe e satura em ~0.05–0.15
+    if round_idx <= 2:
+        return 0.0
+    return min(0.10, 0.03 * (round_idx - 2))
+
+def run_federated_coln(
+    clients,
+    rounds=15,
+    epochs=10,
+    batch_size=256,
+    use_oversample=True,
+    pos_target=0.35,         # oversampling target
+    agg_equal_weights=True,  # True: equal weights; False: weighted by data size
+    threshold_fixed=0.5,     # 🔹 FIXED THRESHOLD for all evaluations
+    verbose_rounds=True,     # print metrics each round
+):
+    """
+    Executes the federated CoLN+ loop using only the `clients` dictionary,
+    already preprocessed.
+
+    Each clients[cid] must contain:
+        - "X_tr", "y_tr", "X_te", "y_te"
+
+    Returns:
+        - global_model: final federated model
+        - df_history: DataFrame with round-by-round metrics
+        - res_final_fed: dict with final metrics on global test set
+    """
+
+    import numpy as np
+    import pandas as pd
+    from sklearn.metrics import confusion_matrix, roc_auc_score
+
+    # --- Sanity check ---
+    if not isinstance(clients, dict) or len(clients) == 0:
+        raise ValueError("`clients` is empty or invalid.")
+
+    req_keys = {"X_tr", "y_tr", "X_te", "y_te"}
+    for cid, data in clients.items():
+        miss = req_keys - set(data.keys())
+        if miss:
+            raise ValueError(f"Client {cid} missing keys: {miss}")
+
+    # --- Build global test set ---
+    try:
+        X_test_global = np.vstack([c["X_te"] for c in clients.values()])
+        y_test_global = np.concatenate([c["y_te"] for c in clients.values()])
+        input_dim = next(iter(clients.values()))["X_tr"].shape[1]
+    except Exception as e:
+        raise RuntimeError(f"Error building global test sets: {e}")
+
+    # --- Metric computation helper ---
+    def compute_metrics(y_true, y_proba, thr):
+        y_pred = (y_proba >= thr).astype(int)
+        tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+
+        acc  = (tp + tn) / (tp + tn + fp + fn)
+        sens = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        f1   = 2 * prec * sens / (prec + sens + 1e-12)
+        auc  = roc_auc_score(y_true, y_proba) if len(np.unique(y_true)) > 1 else float("nan")
+
+        return {
+            "Accuracy": acc,
+            "F1-score": f1,
+            "Precision": prec,
+            "Sensitivity (Recall)": sens,
+            "Specificity": spec,
+            "AUC": auc,
+            "TP": tp, "FP": fp, "FN": fn, "TN": tn,
+        }
+
+    # --- Initialize global model ---
+    global_model = build_mlp(input_dim)
+    global_weights = global_model.get_weights()
+    history_rounds = []
+
+    # --- Federated Loop ---
+    for rnd in range(1, rounds + 1):
+        local_weights_list, local_rh = [], []
+
+        for cid, data in clients.items():
+            X_tr_fit, y_tr_fit = data["X_tr"], data["y_tr"]
+            if X_tr_fit.shape[0] == 0:
+                continue
+
+            local_model = build_mlp(input_dim)
+            local_model.set_weights(global_weights)
+
+            if use_oversample:
+                X_tr_fit, y_tr_fit = oversample_minority(X_tr_fit, y_tr_fit, pos_target=pos_target)
+
+            _ = local_model.fit(
+                X_tr_fit, y_tr_fit,
+                epochs=epochs,
+                batch_size=batch_size,
+                verbose=0,
+                callbacks=[
+                    ReduceLROnPlateau(monitor="loss", factor=0.5, patience=2, min_lr=1e-5, verbose=0),
+                    EarlyStopping(monitor="loss", patience=3, restore_best_weights=True),
+                ],
+            )
+
+            w = 1.0 if agg_equal_weights else float(len(y_tr_fit))
+            local_rh.append(w)
+            local_weights_list.append(local_model.get_weights())
+
+        if not local_weights_list:
+            raise RuntimeError("No clients produced local weights in this round.")
+
+        # Normalize weights
+        s = float(sum(local_rh))
+        if s == 0.0:
+            raise RuntimeError("Sum of local weights is zero; check aggregation.")
+        local_rh = [w / s for w in local_rh]
+
+        # Aggregation
+        new_weights = combined_learning_coln(
+            models_weights=local_weights_list,
+            r_h_list=local_rh,
+            c=schedule_c(rnd, rounds),
+            lambda_beta=schedule_lambda_beta(rnd, rounds),
+            use_layer_c=True,
+            gamma=1.5,
+        )
+        global_weights = new_weights
+        global_model.set_weights(global_weights)
+
+        # --- Evaluation (with fixed threshold) ---
+        y_proba_round = global_model.predict(X_test_global, verbose=0).ravel()
+        res_round = compute_metrics(y_test_global, y_proba_round, threshold_fixed)
+        res_round["round"] = rnd
+        res_round["Threshold"] = threshold_fixed
+        history_rounds.append(res_round)
